@@ -23,7 +23,7 @@
     ],
     "vars": {
         "AUTH_ENABLED": "true",
-        "AUTH_REQUIRED_FOR_READ": "true"  // 启用访客模式
+        "AUTH_REQUIRED_FOR_READ": "true",  // 启用访客模式
         "AUTH_USERNAME": "linuxdo",
         "AUTH_PASSWORD": "linuxdo",
         "AUTH_SECRET": "linuxdo"
