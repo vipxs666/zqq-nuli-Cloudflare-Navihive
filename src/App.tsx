@@ -6,6 +6,9 @@ import { GroupWithSites } from './types';
 import ThemeToggle from './components/ThemeToggle';
 import GroupCard from './components/GroupCard';
 import LoginForm from './components/LoginForm';
+import SearchBox from './components/SearchBox';
+import { sanitizeCSS, isSecureUrl, extractDomain } from './utils/url';
+import { SearchResultItem } from './utils/search';
 import './App.css';
 import {
   DndContext,
@@ -52,6 +55,8 @@ import {
   Snackbar,
   InputAdornment,
   Slider,
+  FormControlLabel,
+  Switch,
 } from '@mui/material';
 import SortIcon from '@mui/icons-material/Sort';
 import SaveIcon from '@mui/icons-material/Save';
@@ -82,25 +87,6 @@ enum SortMode {
   SiteSort, // 站点排序
 }
 
-// 辅助函数：提取域名
-function extractDomain(url: string): string | null {
-  if (!url) return null;
-
-  try {
-    // 尝试自动添加协议头，如果缺少的话
-    let fullUrl = url;
-    if (!/^https?:\/\//i.test(url)) {
-      fullUrl = 'http://' + url;
-    }
-    const parsedUrl = new URL(fullUrl);
-    return parsedUrl.hostname;
-  } catch {
-    // 尝试备用方法
-    const match = url.match(/^(?:https?:\/\/)?(?:[^@\n]+@)?(?:www\.)?([^:/\n?]+)/im);
-    return match && match[1] ? match[1] : url;
-  }
-}
-
 // 默认配置
 const DEFAULT_CONFIGS = {
   'site.title': '导航站',
@@ -109,6 +95,8 @@ const DEFAULT_CONFIGS = {
   'site.backgroundImage': '', // 背景图片URL
   'site.backgroundOpacity': '0.15', // 背景蒙版透明度
   'site.iconApi': 'https://www.faviconextractor.com/favicon/{domain}?larger=true', // 默认使用的API接口，带上 ?larger=true 参数可以获取最大尺寸的图标
+  'site.searchBoxEnabled': 'true', // 是否启用搜索框
+  'site.searchBoxGuestEnabled': 'true', // 访客是否可以使用搜索框
 };
 
 function App() {
@@ -151,6 +139,10 @@ function App() {
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loginLoading, setLoginLoading] = useState(false);
 
+  // 访问模式状态 (readonly: 访客模式, edit: 编辑模式)
+  type ViewMode = 'readonly' | 'edit';
+  const [viewMode, setViewMode] = useState<ViewMode>('readonly');
+
   // 配置状态
   const [configs, setConfigs] = useState<Record<string, string>>(DEFAULT_CONFIGS);
   const [openConfig, setOpenConfig] = useState(false);
@@ -178,7 +170,11 @@ function App() {
   // 新增状态管理
   const [openAddGroup, setOpenAddGroup] = useState(false);
   const [openAddSite, setOpenAddSite] = useState(false);
-  const [newGroup, setNewGroup] = useState<Partial<Group>>({ name: '', order_num: 0 });
+  const [newGroup, setNewGroup] = useState<Partial<Group>>({
+    name: '',
+    order_num: 0,
+    is_public: 1, // 默认为公开
+  });
   const [newSite, setNewSite] = useState<Partial<Site>>({
     name: '',
     url: '',
@@ -187,6 +183,7 @@ function App() {
     notes: '',
     order_num: 0,
     group_id: 0,
+    is_public: 1, // 默认为公开
   });
 
   // 新增菜单状态
@@ -221,13 +218,13 @@ function App() {
       setIsAuthChecking(true);
       console.log('开始检查认证状态...');
 
-      // 尝试进行API调用，检查是否需要认证
+      // 尝试进行API调用,检查是否需要认证
       const result = await api.checkAuthStatus();
       console.log('认证检查结果:', result);
 
       if (!result) {
-        // 未认证，需要登录
-        console.log('未认证，设置需要登录状态');
+        // 未认证，设置为访客模式
+        console.log('未认证，设置访客模式');
 
         // 如果有token但无效，清除它
         if (api.isLoggedIn()) {
@@ -235,26 +232,39 @@ function App() {
           api.logout();
         }
 
-        // 直接更新状态，确保先设置认证状态再结束检查
+        // 设置为访客模式（可以查看公开内容）
         setIsAuthenticated(false);
-        setIsAuthRequired(true);
+        setIsAuthRequired(false); // 允许访客访问
+        setViewMode('readonly');
+
+        // 加载公开数据
+        await fetchData();
+        await fetchConfigs();
       } else {
-        // 直接更新认证状态
+        // 已认证，设置为编辑模式
         setIsAuthenticated(true);
         setIsAuthRequired(false);
+        setViewMode('edit');
 
-        // 如果已经登录或不需要认证，继续加载数据
+        // 加载所有数据（包括私密内容）
         console.log('已认证，开始加载数据');
         await fetchData();
         await fetchConfigs();
       }
     } catch (error) {
       console.error('认证检查失败:', error);
-      // 如果返回401，说明需要认证
-      if (error instanceof Error && error.message.includes('认证')) {
-        console.log('检测到认证错误，设置需要登录状态');
-        setIsAuthenticated(false);
-        setIsAuthRequired(true);
+      // 出错时也允许访客访问
+      console.log('认证检查出错，设置访客模式');
+      setIsAuthenticated(false);
+      setIsAuthRequired(false);
+      setViewMode('readonly');
+
+      // 尝试加载公开数据
+      try {
+        await fetchData();
+        await fetchConfigs();
+      } catch (e) {
+        console.error('加载公开数据失败:', e);
       }
     } finally {
       console.log('认证检查完成');
@@ -269,41 +279,52 @@ function App() {
       setLoginError(null);
 
       // 调用登录接口
-      const success = await api.login(username, password, rememberMe);
+      const loginResponse = await api.login(username, password, rememberMe);
 
-      if (success) {
-        // 登录成功
+      if (loginResponse?.success) {
+        // 登录成功，切换到编辑模式
         setIsAuthenticated(true);
         setIsAuthRequired(false);
-        // 加载数据
+        setViewMode('edit');
+
+        // 重新加载数据（包括私密内容）
         await fetchData();
         await fetchConfigs();
       } else {
         // 登录失败
-        handleError('用户名或密码错误');
+        const message = loginResponse?.message || '用户名或密码错误';
+        handleError(message);
+        setLoginError(message);
         setIsAuthenticated(false);
+        setViewMode('readonly');
+        return;
       }
     } catch (error) {
       console.error('登录失败:', error);
       handleError('登录失败: ' + (error instanceof Error ? error.message : '未知错误'));
       setIsAuthenticated(false);
+      setViewMode('readonly');
     } finally {
       setLoginLoading(false);
     }
   };
 
   // 登出功能
-  const handleLogout = () => {
-    api.logout();
+  const handleLogout = async () => {
+    await api.logout();
     setIsAuthenticated(false);
-    setIsAuthRequired(true);
+    setIsAuthRequired(false); // 允许继续以访客身份访问
+    setViewMode('readonly'); // 切换到只读模式
 
-    // 清空数据
-    setGroups([]);
+    // 重新加载数据（仅公开内容）
+    await fetchData();
+    await fetchConfigs();
+
     handleMenuClose();
 
     // 显示提示信息
-    setError('已退出登录，请重新登录');
+    setSnackbarMessage('已退出登录，当前为访客模式');
+    setSnackbarOpen(true);
   };
 
   // 加载配置
@@ -349,30 +370,18 @@ function App() {
       document.head.appendChild(styleElement);
     }
 
-    // 添加安全过滤，防止CSS注入攻击
-    const sanitizedCss = sanitizeCSS(customCss || '');
-    styleElement.textContent = sanitizedCss;
+    // 使用安全的 CSS 清理函数，防止XSS攻击
+    const sanitized = sanitizeCSS(customCss || '');
+    styleElement.textContent = sanitized;
+
+    // 清理函数：组件卸载时移除样式
+    return () => {
+      const el = document.getElementById('custom-style');
+      if (el) {
+        el.remove();
+      }
+    };
   }, [configs]);
-
-  // CSS安全过滤函数
-  const sanitizeCSS = (css: string): string => {
-    if (!css) return '';
-
-    // 移除可能导致XSS的内容
-    return (
-      css
-        // 移除包含javascript:的URL
-        .replace(/url\s*\(\s*(['"]?)javascript:/gi, 'url($1invalid:')
-        // 移除expression
-        .replace(/expression\s*\(/gi, 'invalid(')
-        // 移除import
-        .replace(/@import/gi, '/* @import */')
-        // 移除behavior
-        .replace(/behavior\s*:/gi, '/* behavior: */')
-        // 过滤content属性中的不安全内容
-        .replace(/content\s*:\s*(['"]?).*?url\s*\(\s*(['"]?)javascript:/gi, 'content: $1')
-    );
-  };
 
   // 同步HTML的class以保持与现有CSS兼容
   useEffect(() => {
@@ -399,21 +408,9 @@ function App() {
     try {
       setLoading(true);
       setError(null);
-      const groupsData = await api.getGroups();
 
-      // 获取每个分组的站点并确保id存在
-      const groupsWithSites = await Promise.all(
-        groupsData
-          .filter((group) => group.id !== undefined) // 过滤掉没有id的分组
-          .map(async (group) => {
-            const sites = await api.getSites(group.id);
-            return {
-              ...group,
-              id: group.id as number, // 确保id不为undefined
-              sites,
-            } as GroupWithSites;
-          })
-      );
+      // 使用新的 getGroupsWithSites API 优化 N+1 查询问题
+      const groupsWithSites = await api.getGroupsWithSites();
 
       setGroups(groupsWithSites);
     } catch (error) {
@@ -551,7 +548,7 @@ function App() {
 
   // 新增分组相关函数
   const handleOpenAddGroup = () => {
-    setNewGroup({ name: '', order_num: groups.length });
+    setNewGroup({ name: '', order_num: groups.length, is_public: 1 }); // 默认公开
     setOpenAddGroup(true);
   };
 
@@ -598,6 +595,7 @@ function App() {
       notes: '',
       group_id: groupId,
       order_num: maxOrderNum,
+      is_public: 1, // 默认为公开
     });
 
     setOpenAddSite(true);
@@ -726,8 +724,11 @@ function App() {
   // 处理文件选择
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      setImportFile(e.target.files[0]);
-      setImportError(null);
+      const selectedFile = e.target.files[0];
+      if (selectedFile) {
+        setImportFile(selectedFile);
+        setImportError(null);
+      }
     }
   };
 
@@ -938,7 +939,7 @@ function App() {
         }}
       >
         {/* 背景图片 */}
-        {configs['site.backgroundImage'] && (
+        {configs['site.backgroundImage'] && isSecureUrl(configs['site.backgroundImage']) && (
           <>
             <Box
               sx={{
@@ -1045,87 +1046,149 @@ function App() {
                 </>
               ) : (
                 <>
-                  <Button
-                    variant='contained'
-                    color='primary'
-                    startIcon={<AddIcon />}
-                    onClick={handleOpenAddGroup}
-                    size='small'
-                    sx={{
-                      minWidth: 'auto',
-                      fontSize: { xs: '0.75rem', sm: '0.875rem' },
-                    }}
-                  >
-                    新增分组
-                  </Button>
+                  {viewMode === 'readonly' ? (
+                    // 访客模式：显示登录按钮
+                    <Button
+                      variant='contained'
+                      color='primary'
+                      onClick={() => setIsAuthRequired(true)}
+                      size='small'
+                      sx={{
+                        minWidth: 'auto',
+                        fontSize: { xs: '0.75rem', sm: '0.875rem' },
+                      }}
+                    >
+                      管理员登录
+                    </Button>
+                  ) : (
+                    // 编辑模式：显示管理按钮
+                    <>
+                      <Button
+                        variant='contained'
+                        color='primary'
+                        startIcon={<AddIcon />}
+                        onClick={handleOpenAddGroup}
+                        size='small'
+                        sx={{
+                          minWidth: 'auto',
+                          fontSize: { xs: '0.75rem', sm: '0.875rem' },
+                        }}
+                      >
+                        新增分组
+                      </Button>
 
-                  <Button
-                    variant='outlined'
-                    color='primary'
-                    startIcon={<MenuIcon />}
-                    onClick={handleMenuOpen}
-                    aria-controls={openMenu ? 'navigation-menu' : undefined}
-                    aria-haspopup='true'
-                    aria-expanded={openMenu ? 'true' : undefined}
-                    size='small'
-                    sx={{
-                      minWidth: 'auto',
-                      fontSize: { xs: '0.75rem', sm: '0.875rem' },
-                    }}
-                  >
-                    更多选项
-                  </Button>
-                  <Menu
-                    id='navigation-menu'
-                    anchorEl={menuAnchorEl}
-                    open={openMenu}
-                    onClose={handleMenuClose}
-                    MenuListProps={{
-                      'aria-labelledby': 'navigation-button',
-                    }}
-                  >
-                    <MenuItem onClick={startGroupSort}>
-                      <ListItemIcon>
-                        <SortIcon fontSize='small' />
-                      </ListItemIcon>
-                      <ListItemText>编辑排序</ListItemText>
-                    </MenuItem>
-                    <MenuItem onClick={handleOpenConfig}>
-                      <ListItemIcon>
-                        <SettingsIcon fontSize='small' />
-                      </ListItemIcon>
-                      <ListItemText>网站设置</ListItemText>
-                    </MenuItem>
-                    <Divider />
-                    <MenuItem onClick={handleExportData}>
-                      <ListItemIcon>
-                        <FileDownloadIcon fontSize='small' />
-                      </ListItemIcon>
-                      <ListItemText>导出数据</ListItemText>
-                    </MenuItem>
-                    <MenuItem onClick={handleOpenImport}>
-                      <ListItemIcon>
-                        <FileUploadIcon fontSize='small' />
-                      </ListItemIcon>
-                      <ListItemText>导入数据</ListItemText>
-                    </MenuItem>
-                    {isAuthenticated && (
-                      <>
-                        <Divider />
-                        <MenuItem onClick={handleLogout} sx={{ color: 'error.main' }}>
-                          <ListItemIcon sx={{ color: 'error.main' }}>
-                            <LogoutIcon fontSize='small' />
+                      <Button
+                        variant='outlined'
+                        color='primary'
+                        startIcon={<MenuIcon />}
+                        onClick={handleMenuOpen}
+                        aria-controls={openMenu ? 'navigation-menu' : undefined}
+                        aria-haspopup='true'
+                        aria-expanded={openMenu ? 'true' : undefined}
+                        size='small'
+                        sx={{
+                          minWidth: 'auto',
+                          fontSize: { xs: '0.75rem', sm: '0.875rem' },
+                        }}
+                      >
+                        更多选项
+                      </Button>
+                      <Menu
+                        id='navigation-menu'
+                        anchorEl={menuAnchorEl}
+                        open={openMenu}
+                        onClose={handleMenuClose}
+                        MenuListProps={{
+                          'aria-labelledby': 'navigation-button',
+                        }}
+                      >
+                        <MenuItem onClick={startGroupSort}>
+                          <ListItemIcon>
+                            <SortIcon fontSize='small' />
                           </ListItemIcon>
-                          <ListItemText>退出登录</ListItemText>
+                          <ListItemText>编辑排序</ListItemText>
                         </MenuItem>
-                      </>
-                    )}
-                  </Menu>
+                        <MenuItem onClick={handleOpenConfig}>
+                          <ListItemIcon>
+                            <SettingsIcon fontSize='small' />
+                          </ListItemIcon>
+                          <ListItemText>网站设置</ListItemText>
+                        </MenuItem>
+                        <Divider />
+                        <MenuItem onClick={handleExportData}>
+                          <ListItemIcon>
+                            <FileDownloadIcon fontSize='small' />
+                          </ListItemIcon>
+                          <ListItemText>导出数据</ListItemText>
+                        </MenuItem>
+                        <MenuItem onClick={handleOpenImport}>
+                          <ListItemIcon>
+                            <FileUploadIcon fontSize='small' />
+                          </ListItemIcon>
+                          <ListItemText>导入数据</ListItemText>
+                        </MenuItem>
+                        {isAuthenticated && (
+                          <>
+                            <Divider />
+                            <MenuItem onClick={handleLogout} sx={{ color: 'error.main' }}>
+                              <ListItemIcon sx={{ color: 'error.main' }}>
+                                <LogoutIcon fontSize='small' />
+                              </ListItemIcon>
+                              <ListItemText>退出登录</ListItemText>
+                            </MenuItem>
+                          </>
+                        )}
+                      </Menu>
+                    </>
+                  )}
                 </>
               )}
               <ThemeToggle darkMode={darkMode} onToggle={toggleTheme} />
             </Stack>
           </Box>
+
+          {/* 搜索框 - 根据配置条件渲染 */}
+          {(() => {
+            // 检查搜索框是否启用
+            const searchBoxEnabled = configs['site.searchBoxEnabled'] === 'true';
+            if (!searchBoxEnabled) {
+              return null;
+            }
+
+            // 如果是访客模式，检查访客是否可用搜索框
+            if (viewMode === 'readonly') {
+              const guestEnabled = configs['site.searchBoxGuestEnabled'] === 'true';
+              if (!guestEnabled) {
+                return null;
+              }
+            }
+
+            return (
+              <Box sx={{ mb: 4 }}>
+                <SearchBox
+                  groups={groups.map((g) => ({
+                    id: g.id,
+                    name: g.name,
+                    order_num: g.order_num,
+                    is_public: g.is_public,
+                    created_at: g.created_at,
+                    updated_at: g.updated_at,
+                  }))}
+                  sites={groups.flatMap((g) => g.sites || [])}
+                  onInternalResultClick={(result: SearchResultItem) => {
+                    // 可选：滚动到对应的元素
+                    if (result.type === 'group') {
+                      const groupElement = document.getElementById(`group-${result.id}`);
+                      groupElement?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    } else if (result.type === 'site' && result.groupId) {
+                      const groupElement = document.getElementById(`group-${result.groupId}`);
+                      groupElement?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                  }}
+                />
+              </Box>
+            );
+          })()}
 
           {loading && (
             <Box
@@ -1174,20 +1237,22 @@ function App() {
               ) : (
                 <Stack spacing={5}>
                   {groups.map((group) => (
-                    <GroupCard
-                      key={`group-${group.id}`}
-                      group={group}
-                      sortMode={sortMode === SortMode.None ? 'None' : 'SiteSort'}
-                      currentSortingGroupId={currentSortingGroupId}
-                      onUpdate={handleSiteUpdate}
-                      onDelete={handleSiteDelete}
-                      onSaveSiteOrder={handleSaveSiteOrder}
-                      onStartSiteSort={startSiteSort}
-                      onAddSite={handleOpenAddSite}
-                      onUpdateGroup={handleGroupUpdate}
-                      onDeleteGroup={handleGroupDelete}
-                      configs={configs}
-                    />
+                    <Box key={`group-${group.id}`} id={`group-${group.id}`}>
+                      <GroupCard
+                        group={group}
+                        sortMode={sortMode === SortMode.None ? 'None' : 'SiteSort'}
+                        currentSortingGroupId={currentSortingGroupId}
+                        viewMode={viewMode}
+                        onUpdate={handleSiteUpdate}
+                        onDelete={handleSiteDelete}
+                        onSaveSiteOrder={handleSaveSiteOrder}
+                        onStartSiteSort={startSiteSort}
+                        onAddSite={handleOpenAddSite}
+                        onUpdateGroup={handleGroupUpdate}
+                        onDeleteGroup={handleGroupDelete}
+                        configs={configs}
+                      />
+                    </Box>
                   ))}
                 </Stack>
               )}
@@ -1236,6 +1301,31 @@ function App() {
                 value={newGroup.name}
                 onChange={handleGroupInputChange}
                 sx={{ mb: 2 }}
+              />
+
+              {/* 公开/私密开关 */}
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={newGroup.is_public !== 0}
+                    onChange={(e) =>
+                      setNewGroup({ ...newGroup, is_public: e.target.checked ? 1 : 0 })
+                    }
+                    color='primary'
+                  />
+                }
+                label={
+                  <Box>
+                    <Typography variant='body1'>
+                      {newGroup.is_public !== 0 ? '公开分组' : '私密分组'}
+                    </Typography>
+                    <Typography variant='caption' color='text.secondary'>
+                      {newGroup.is_public !== 0
+                        ? '所有访客都可以看到此分组'
+                        : '只有管理员登录后才能看到此分组'}
+                    </Typography>
+                  </Box>
+                }
               />
             </DialogContent>
             <DialogActions sx={{ px: 3, pb: 3 }}>
@@ -1379,6 +1469,31 @@ function App() {
                   value={newSite.notes}
                   onChange={handleSiteInputChange}
                 />
+
+                {/* 公开/私密开关 */}
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={newSite.is_public !== 0}
+                      onChange={(e) =>
+                        setNewSite({ ...newSite, is_public: e.target.checked ? 1 : 0 })
+                      }
+                      color='primary'
+                    />
+                  }
+                  label={
+                    <Box>
+                      <Typography variant='body1'>
+                        {newSite.is_public !== 0 ? '公开站点' : '私密站点'}
+                      </Typography>
+                      <Typography variant='caption' color='text.secondary'>
+                        {newSite.is_public !== 0
+                          ? '所有访客都可以看到此站点'
+                          : '只有管理员登录后才能看到此站点'}
+                      </Typography>
+                    </Box>
+                  }
+                />
               </Stack>
             </DialogContent>
             <DialogActions sx={{ px: 3, pb: 3 }}>
@@ -1510,6 +1625,59 @@ function App() {
                       值越大，背景图片越清晰，内容可能越难看清
                     </Typography>
                   </Box>
+                </Box>
+                {/* 搜索框功能设置 */}
+                <Box sx={{ mb: 1 }}>
+                  <Typography variant='subtitle1' gutterBottom>
+                    搜索框功能设置
+                  </Typography>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={tempConfigs['site.searchBoxEnabled'] === 'true'}
+                        onChange={(e) =>
+                          setTempConfigs({
+                            ...tempConfigs,
+                            'site.searchBoxEnabled': e.target.checked ? 'true' : 'false',
+                          })
+                        }
+                        color='primary'
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant='body1'>启用搜索框</Typography>
+                        <Typography variant='caption' color='text.secondary'>
+                          控制是否在页面中显示搜索框功能
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                  {tempConfigs['site.searchBoxEnabled'] === 'true' && (
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={tempConfigs['site.searchBoxGuestEnabled'] === 'true'}
+                          onChange={(e) =>
+                            setTempConfigs({
+                              ...tempConfigs,
+                              'site.searchBoxGuestEnabled': e.target.checked ? 'true' : 'false',
+                            })
+                          }
+                          color='primary'
+                        />
+                      }
+                      label={
+                        <Box>
+                          <Typography variant='body1'>访客可用搜索框</Typography>
+                          <Typography variant='caption' color='text.secondary'>
+                            允许未登录的访客使用搜索功能
+                          </Typography>
+                        </Box>
+                      }
+                      sx={{ ml: 4, mt: 1 }}
+                    />
+                  )}
                 </Box>
                 <TextField
                   margin='dense'

@@ -1,30 +1,19 @@
-import { Group, Site, LoginResponse, ExportData, ImportResult } from './http';
+import { Group, Site, LoginResponse, ExportData, ImportResult, GroupWithSites } from './http';
 
 export class NavigationClient {
   private baseUrl: string;
-  private token: string | null = null;
+  public isAuthenticated: boolean = false; // 新增：公开认证状态
 
   constructor(baseUrl = '/api') {
     this.baseUrl = baseUrl;
-    // 从本地存储加载令牌
-    this.token = localStorage.getItem('auth_token');
+    // 不再使用 localStorage 存储 token，改用 HttpOnly Cookie
   }
 
-  // 检查是否已登录
+  // 检查是否已登录（通过尝试请求来判断）
   isLoggedIn(): boolean {
-    return !!this.token;
-  }
-
-  // 设置认证令牌
-  setToken(token: string): void {
-    this.token = token;
-    localStorage.setItem('auth_token', token);
-  }
-
-  // 清除认证令牌
-  clearToken(): void {
-    this.token = null;
-    localStorage.removeItem('auth_token');
+    // Cookie 由浏览器自动管理，无法直接检查
+    // 需要通过 API 调用来验证
+    return true; // 实际验证在 checkAuthStatus 中
   }
 
   // 登录API
@@ -39,15 +28,16 @@ export class NavigationClient {
         headers: {
           'Content-Type': 'application/json',
         },
+        credentials: 'include', // 重要：包含 Cookie
         body: JSON.stringify({ username, password, rememberMe }),
       });
 
-      const data = await response.json();
+      const data: LoginResponse = await response.json();
 
-      if (data.success && data.token) {
-        this.setToken(data.token);
-      }
+      // 根据登录结果更新认证状态
+      this.isAuthenticated = data.success === true;
 
+      // Cookie 会自动由浏览器设置，无需手动处理
       return data;
     } catch (error) {
       console.error('登录失败:', error);
@@ -59,33 +49,59 @@ export class NavigationClient {
   }
 
   // 登出
-  logout(): void {
-    this.clearToken();
+  async logout(): Promise<void> {
+    try {
+      await fetch(`${this.baseUrl}/logout`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+
+      // 登出成功，更新认证状态
+      this.isAuthenticated = false;
+    } catch (error) {
+      console.error('登出失败:', error);
+    }
   }
 
-  private async request(endpoint: string, options = {}) {
+  private async request(endpoint: string, options: RequestInit = {}) {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
 
-    // 如果有认证令牌，则添加到请求头
-    if (this.token) {
-      headers['Authorization'] = `Bearer ${this.token}`;
-    }
+    // Cookie 会自动包含在请求中，无需手动设置
 
     const response = await fetch(`${this.baseUrl}/${endpoint}`, {
       headers,
+      credentials: 'include', // 重要：自动包含 Cookie
       ...options,
     });
 
     if (response.status === 401) {
-      // 清除无效令牌
-      this.clearToken();
+      // 认证失败
+      this.isAuthenticated = false;
+
+      // 对于 GET 请求（只读操作），允许返回空数据而不抛出异常
+      if (!options.method || options.method === 'GET') {
+        // 尝试解析响应，如果是访客模式可能返回部分数据
+        try {
+          return response.json();
+        } catch {
+          // 如果无法解析，返回空数组/对象
+          return endpoint.includes('config') ? {} : [];
+        }
+      }
+
+      // 对于写操作（POST/PUT/DELETE），必须抛出异常
       throw new Error('认证已过期或无效，请重新登录');
     }
 
     if (!response.ok) {
       throw new Error(`API错误: ${response.status}`);
+    }
+
+    // 请求成功，标记为已认证（如果之前未认证）
+    if (response.ok && !this.isAuthenticated) {
+      this.isAuthenticated = true;
     }
 
     return response.json();
@@ -94,33 +110,32 @@ export class NavigationClient {
   // 检查身份验证状态
   async checkAuthStatus(): Promise<boolean> {
     try {
-      // 如果本地没有令牌，直接返回未认证
-      if (!this.token) {
+      // 调用专门的认证状态检查端点
+      const response = await fetch(`${this.baseUrl}/auth/status`, {
+        method: 'GET',
+        credentials: 'include', // 包含 Cookie
+      });
+
+      if (!response.ok) {
         return false;
       }
 
-      // 尝试获取配置，如果成功则表示已认证
-      await this.getConfigs();
-      return true;
+      const data = await response.json();
+      return data.authenticated === true;
     } catch (error) {
-      console.log('认证检查:', error);
-
-      // 特定处理401错误
-      if (error instanceof Error) {
-        if (error.message.includes('认证') || error.message.includes('API错误: 401')) {
-          this.clearToken();
-          return false;
-        }
-      }
-
-      // 其他错误不影响认证状态，如果有token则认为已认证
-      return !!this.token;
+      console.log('认证状态检查失败:', error);
+      return false;
     }
   }
 
   // 分组相关API
   async getGroups(): Promise<Group[]> {
     return this.request('groups');
+  }
+
+  // 获取所有分组及其站点 (使用 JOIN 优化,避免 N+1 查询)
+  async getGroupsWithSites(): Promise<GroupWithSites[]> {
+    return this.request('groups-with-sites');
   }
 
   async getGroup(id: number): Promise<Group> {

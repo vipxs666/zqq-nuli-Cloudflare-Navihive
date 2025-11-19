@@ -1,6 +1,7 @@
 // src/components/SiteSettingsModal.tsx
 import { useState } from 'react';
 import { Site, Group } from '../API/http';
+import { extractDomain, isSecureUrl } from '../utils/url';
 // Material UI 导入
 import {
   Dialog,
@@ -22,6 +23,9 @@ import {
   useTheme,
   SelectChangeEvent,
   InputAdornment,
+  Alert,
+  FormControlLabel,
+  Switch,
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -36,25 +40,6 @@ interface SiteSettingsModalProps {
   onClose: () => void;
   groups?: Group[]; // 可选的分组列表
   iconApi?: string; // 图标API配置
-}
-
-// 辅助函数：提取域名
-function extractDomain(url: string): string | null {
-  if (!url) return null;
-
-  try {
-    // 尝试自动添加协议头，如果缺少的话
-    let fullUrl = url;
-    if (!/^https?:\/\//i.test(url)) {
-      fullUrl = 'http://' + url;
-    }
-    const parsedUrl = new URL(fullUrl);
-    return parsedUrl.hostname;
-  } catch (e) {
-    // 尝试备用方法
-    const match = url.match(/^(?:https?:\/\/)?(?:[^@\n]+@)?(?:www\.)?([^:\/\n?]+)/im);
-    return match && match[1] ? match[1] : url;
-  }
 }
 
 export default function SiteSettingsModal({
@@ -75,10 +60,14 @@ export default function SiteSettingsModal({
     description: site.description || '',
     notes: site.notes || '',
     group_id: String(site.group_id),
+    is_public: site.is_public ?? 1, // 默认为公开
   });
 
   // 用于预览图标
   const [iconPreview, setIconPreview] = useState<string | null>(site.icon || null);
+
+  // 验证错误
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   // 处理表单字段变化
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -132,6 +121,21 @@ export default function SiteSettingsModal({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     e.stopPropagation();
+
+    // 验证 URL
+    if (!formData.url) {
+      setValidationError('网站地址不能为空');
+      return;
+    }
+
+    // 验证图标 URL（如果提供）
+    if (formData.icon && !isSecureUrl(formData.icon) && !formData.icon.startsWith('/')) {
+      setValidationError('图标 URL 不安全，只允许 HTTPS 协议和公网地址');
+      return;
+    }
+
+    // 清除验证错误
+    setValidationError(null);
 
     // 更新网站信息，将group_id转为数字
     onUpdate({
@@ -190,6 +194,13 @@ export default function SiteSettingsModal({
       <form onSubmit={handleSubmit}>
         <DialogContent sx={{ pt: 2 }}>
           <Stack spacing={2.5}>
+            {/* 验证错误提示 */}
+            {validationError && (
+              <Alert severity='error' onClose={() => setValidationError(null)}>
+                {validationError}
+              </Alert>
+            )}
+
             {/* 网站名称 */}
             <TextField
               id='name'
@@ -347,6 +358,34 @@ export default function SiteSettingsModal({
               placeholder='可选的私人备注'
               variant='outlined'
               size='small'
+            />
+
+            {/* 公开/私密开关 */}
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={formData.is_public !== 0}
+                  onChange={(e) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      is_public: e.target.checked ? 1 : 0,
+                    }))
+                  }
+                  color='primary'
+                />
+              }
+              label={
+                <Box>
+                  <Typography variant='body1'>
+                    {formData.is_public !== 0 ? '公开站点' : '私密站点'}
+                  </Typography>
+                  <Typography variant='caption' color='text.secondary'>
+                    {formData.is_public !== 0
+                      ? '所有访客都可以看到此站点'
+                      : '只有管理员登录后才能看到此站点'}
+                  </Typography>
+                </Box>
+              }
             />
           </Stack>
         </DialogContent>
